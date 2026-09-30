@@ -1,17 +1,23 @@
+import json
 import os
 import shutil
 import subprocess
 import threading
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import yt_dlp
 
 # ---------------------------------------------------------------------------
 # ค่าคงที่ / การตั้งค่า
 # ---------------------------------------------------------------------------
-DOWNLOAD_DIR = r"D:\YouTube Downloads"
+DEFAULT_DOWNLOAD_DIR = r"D:\YouTube Downloads"
 URL_PLACEHOLDER = "วางลิงก์ YouTube ที่นี่... (เช่น https://youtube.com/watch?v=...)"
+
+# ไฟล์เก็บค่าโฟลเดอร์ที่ผู้ใช้เลือกไว้ล่าสุด (เก็บข้าง exe / script)
+CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "downloader_config.json"
+)
 
 COLORS = {
     "bg": "#181825",
@@ -35,10 +41,40 @@ def looks_like_youtube_url(text: str) -> bool:
     return t.startswith("http") and ("youtube.com" in t or "youtu.be" in t)
 
 
-def ensure_download_dir():
+def drive_exists(path: str) -> bool:
+    """เช็คว่าไดรฟ์ของ path ที่ให้มามีอยู่จริงในเครื่องหรือไม่ (เช่น D:\\ มีจริงไหม)"""
+    drive = os.path.splitdrive(path)[0]  # เช่น "D:"
+    if not drive:
+        return True  # path สัมพัทธ์ ไม่ใช่ไดรฟ์ ให้ผ่านไปก่อน
+    return os.path.exists(drive + os.sep)
+
+
+def load_saved_folder():
+    """โหลดโฟลเดอร์ที่ผู้ใช้เคยเลือกไว้จากไฟล์ config ถ้ามี"""
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            folder = data.get("download_dir")
+            if folder and drive_exists(folder):
+                return folder
+    except Exception:
+        pass
+    return None
+
+
+def save_folder(folder: str):
+    """บันทึกโฟลเดอร์ที่ผู้ใช้เลือกไว้ลงไฟล์ config เพื่อจำไว้ใช้ครั้งถัดไป"""
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump({"download_dir": folder}, f, ensure_ascii=False)
+    except Exception:
+        pass  # บันทึกไม่ได้ก็ไม่เป็นไร แค่ต้องเลือกใหม่รอบหน้า
+
+
+def ensure_download_dir(path: str) -> bool:
     """สร้างโฟลเดอร์ดาวน์โหลดถ้ายังไม่มี คืนค่า True/False ว่าพร้อมใช้งานหรือไม่"""
     try:
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        os.makedirs(path, exist_ok=True)
         return True
     except Exception:
         return False
@@ -73,11 +109,10 @@ def friendly_error(exc: Exception) -> str:
     if "network" in lower or "timed out" in lower or "connection" in lower or "urlopen" in lower:
         return "เกิดปัญหาการเชื่อมต่ออินเทอร์เน็ต กรุณาตรวจสอบเครือข่ายแล้วลองใหม่"
     if "no space left" in lower or "disk" in lower:
-        return "พื้นที่จัดเก็บไม่เพียงพอ กรุณาตรวจสอบพื้นที่ว่างในไดรฟ์ D"
+        return "พื้นที่จัดเก็บไม่เพียงพอ กรุณาตรวจสอบพื้นที่ว่างในโฟลเดอร์ปลายทาง"
     if "permission" in lower or "access is denied" in lower:
         return "ไม่มีสิทธิ์เขียนไฟล์ลงในโฟลเดอร์ปลายทาง กรุณาตรวจสอบสิทธิ์การเข้าถึง"
 
-    # ตัดข้อความยาวเกินไปให้อ่านง่ายขึ้น
     short = msg.splitlines()[0]
     if len(short) > 160:
         short = short[:160] + "..."
@@ -89,17 +124,76 @@ class PremiumYoutubeDownloader:
     def __init__(self, root):
         self.root = root
         self.root.title("YouTube Downloader Studio")
-        self.root.geometry("560x520")
+        self.root.geometry("560x540")
         self.root.configure(bg=COLORS["bg"])
         self.root.resizable(False, False)
 
         self.is_downloading = False
         self.ffmpeg_available = has_ffmpeg()
-        self.dir_ready = ensure_download_dir()
         self.showing_placeholder = True
+
+        # --- กำหนดโฟลเดอร์ดาวน์โหลดเริ่มต้น ---
+        self.download_dir = self.resolve_initial_download_dir()
 
         self.setup_ui()
         self.refresh_ffmpeg_notice()
+
+    # ------------------------------------------------------------------
+    # จัดการโฟลเดอร์ดาวน์โหลด
+    # ------------------------------------------------------------------
+    def resolve_initial_download_dir(self) -> str:
+        """
+        ตัดสินใจว่าจะใช้โฟลเดอร์ไหนตอนเปิดโปรแกรม:
+        1. ถ้าเคยเลือกไว้และไดรฟ์นั้นยังมีอยู่ -> ใช้ค่าที่เคยเลือก
+        2. ถ้าไดรฟ์ D มีอยู่ -> ใช้ D:\\YouTube Downloads ตามค่า default
+        3. ถ้าไม่มีทั้งคู่ -> เปิดหน้าต่างให้ผู้ใช้เลือกโฟลเดอร์เอง
+        """
+        saved = load_saved_folder()
+        if saved:
+            return saved
+
+        if drive_exists(DEFAULT_DOWNLOAD_DIR) and ensure_download_dir(DEFAULT_DOWNLOAD_DIR):
+            return DEFAULT_DOWNLOAD_DIR
+
+        # ไม่มีไดรฟ์ D หรือสร้างโฟลเดอร์ไม่ได้ -> ให้ผู้ใช้เลือกเอง
+        messagebox.showwarning(
+            "ไม่พบไดรฟ์ D",
+            "ไม่พบไดรฟ์ D ในเครื่องนี้ หรือไม่สามารถสร้างโฟลเดอร์ดาวน์โหลดได้\n"
+            "กรุณาเลือกโฟลเดอร์สำหรับบันทึกไฟล์ในขั้นตอนถัดไป",
+        )
+        chosen = self.ask_folder_dialog(initial=os.path.expanduser("~"))
+        if chosen:
+            save_folder(chosen)
+            return chosen
+
+        # ผู้ใช้กด Cancel -> fallback ไปที่โฟลเดอร์เอกสารของผู้ใช้
+        fallback = os.path.join(os.path.expanduser("~"), "Downloads", "YouTube Downloads")
+        ensure_download_dir(fallback)
+        return fallback
+
+    def ask_folder_dialog(self, initial: str = None) -> str:
+        """เปิดหน้าต่างเลือกโฟลเดอร์ คืนค่า path ที่เลือก หรือ '' ถ้ายกเลิก"""
+        folder = filedialog.askdirectory(
+            title="เลือกโฟลเดอร์สำหรับบันทึกไฟล์ที่ดาวน์โหลด",
+            initialdir=initial or "/",
+            mustexist=True,
+        )
+        return folder
+
+    def change_download_folder(self):
+        """ให้ผู้ใช้เปลี่ยนโฟลเดอร์ปลายทางเองได้ทุกเมื่อผ่านปุ่มใน UI"""
+        chosen = self.ask_folder_dialog(initial=self.download_dir)
+        if not chosen:
+            return
+        if not ensure_download_dir(chosen):
+            messagebox.showerror(
+                "ผิดพลาด",
+                f"ไม่สามารถใช้โฟลเดอร์นี้ได้:\n{chosen}\nกรุณาเลือกโฟลเดอร์อื่น",
+            )
+            return
+        self.download_dir = chosen
+        save_folder(chosen)
+        self.folder_label.config(text=self.download_dir)
 
     # ------------------------------------------------------------------
     # UI
@@ -179,13 +273,13 @@ class PremiumYoutubeDownloader:
             "cursor": "hand2",
         }
 
-        tk.Radiobutton(option_frame, text="🎥 วิดีโอ + เสียง (สมบูรณ์) ⭐ แนะนำ",
+        tk.Radiobutton(option_frame, text=" วิดีโอ + เสียง (สมบูรณ์)  แนะนำ",
                         value="both", variable=self.download_type, **rb_style
                         ).pack(anchor="w", padx=15, pady=4)
-        tk.Radiobutton(option_frame, text="🎬 วิดีโออย่างเดียว (ไม่มีเสียง)",
+        tk.Radiobutton(option_frame, text=" วิดีโออย่างเดียว (ไม่มีเสียง)",
                         value="video_only", variable=self.download_type, **rb_style
                         ).pack(anchor="w", padx=15, pady=4)
-        tk.Radiobutton(option_frame, text="🎵 เสียงอย่างเดียว (Audio/MP3)",
+        tk.Radiobutton(option_frame, text=" เสียงอย่างเดียว (Audio/MP3)",
                         value="audio_only", variable=self.download_type, **rb_style
                         ).pack(anchor="w", padx=15, pady=4)
 
@@ -222,7 +316,7 @@ class PremiumYoutubeDownloader:
 
         self.folder_label = tk.Label(
             text_col,
-            text=DOWNLOAD_DIR,
+            text=self.download_dir,
             font=("Consolas", 9),
             bg=COLORS["surface"],
             fg=COLORS["text"],
@@ -230,8 +324,28 @@ class PremiumYoutubeDownloader:
         )
         self.folder_label.pack(anchor="w")
 
+        btn_col = tk.Frame(inner, bg=COLORS["surface"])
+        btn_col.pack(side="right")
+
+        self.change_folder_btn = tk.Button(
+            btn_col,
+            text="✏ เปลี่ยน",
+            font=("Segoe UI", 8, "bold"),
+            bg=COLORS["surface"],
+            fg=COLORS["muted"],
+            activebackground=COLORS["card"],
+            activeforeground=COLORS["text"],
+            relief="solid",
+            bd=1,
+            highlightbackground=COLORS["border"],
+            cursor="hand2",
+            command=self.change_download_folder,
+            padx=8,
+        )
+        self.change_folder_btn.pack(side="right", padx=(0, 6))
+
         self.open_folder_btn = tk.Button(
-            inner,
+            btn_col,
             text="📂 เปิดโฟลเดอร์",
             font=("Segoe UI", 8, "bold"),
             bg=COLORS["surface"],
@@ -346,18 +460,18 @@ class PremiumYoutubeDownloader:
             pass
 
     def open_download_folder(self):
-        if not ensure_download_dir():
+        if not ensure_download_dir(self.download_dir):
             messagebox.showerror(
                 "ผิดพลาด",
-                f"ไม่สามารถสร้าง/เข้าถึงโฟลเดอร์ได้:\n{DOWNLOAD_DIR}\n"
-                "กรุณาตรวจสอบว่าไดรฟ์ D มีอยู่จริงและมีสิทธิ์เขียนไฟล์",
+                f"ไม่สามารถสร้าง/เข้าถึงโฟลเดอร์ได้:\n{self.download_dir}\n"
+                "กรุณาเลือกโฟลเดอร์อื่นด้วยปุ่ม 'เปลี่ยน'",
             )
             return
         try:
-            os.startfile(DOWNLOAD_DIR)  # Windows only
+            os.startfile(self.download_dir)  # Windows only
         except Exception:
             try:
-                subprocess.Popen(["explorer", DOWNLOAD_DIR])
+                subprocess.Popen(["explorer", self.download_dir])
             except Exception as e:
                 messagebox.showerror("ผิดพลาด", f"ไม่สามารถเปิดโฟลเดอร์ได้:\n{e}")
 
@@ -376,14 +490,19 @@ class PremiumYoutubeDownloader:
 
         mode = self.download_type.get()
 
-        # ตรวจสอบโฟลเดอร์ปลายทางก่อนเริ่ม
-        if not ensure_download_dir():
-            messagebox.showerror(
-                "ผิดพลาด",
-                f"ไม่พบไดรฟ์หรือไม่สามารถสร้างโฟลเดอร์:\n{DOWNLOAD_DIR}\n"
-                "กรุณาตรวจสอบว่าไดรฟ์ D เชื่อมต่ออยู่",
+        # ตรวจสอบโฟลเดอร์ปลายทางก่อนเริ่ม (ไดรฟ์อาจถูกถอดออกระหว่างใช้งาน)
+        if not drive_exists(self.download_dir) or not ensure_download_dir(self.download_dir):
+            messagebox.showwarning(
+                "ไม่พบโฟลเดอร์ปลายทาง",
+                f"ไม่พบหรือไม่สามารถเข้าถึงโฟลเดอร์:\n{self.download_dir}\n"
+                "กรุณาเลือกโฟลเดอร์ใหม่ในขั้นตอนถัดไป",
             )
-            return
+            chosen = self.ask_folder_dialog(initial=os.path.expanduser("~"))
+            if not chosen or not ensure_download_dir(chosen):
+                return
+            self.download_dir = chosen
+            save_folder(chosen)
+            self.folder_label.config(text=self.download_dir)
 
         # ตรวจสอบ ffmpeg สำหรับโหมดที่ต้องใช้
         if mode in ("both", "audio_only") and not has_ffmpeg():
@@ -400,6 +519,7 @@ class PremiumYoutubeDownloader:
         self.download_btn.config(state=tk.DISABLED, bg=COLORS["border"], fg="#6c7086")
         self.paste_btn.config(state=tk.DISABLED)
         self.open_folder_btn.config(state=tk.DISABLED)
+        self.change_folder_btn.config(state=tk.DISABLED)
 
         self.progress["value"] = 0
         self.progress.pack(fill="x", expand=True)
@@ -407,7 +527,7 @@ class PremiumYoutubeDownloader:
 
         threading.Thread(
             target=self.download_video,
-            args=(url, mode),
+            args=(url, mode, self.download_dir),
             daemon=True,
         ).start()
 
@@ -434,7 +554,7 @@ class PremiumYoutubeDownloader:
             self.progress["value"] = pct
         self.status_label.config(text=text, fg=COLORS["warning"])
 
-    def download_video(self, url, mode):
+    def download_video(self, url, mode, target_dir):
         try:
             if mode == "video_only":
                 fmt = "bestvideo/best"
@@ -443,7 +563,7 @@ class PremiumYoutubeDownloader:
             else:  # both
                 fmt = "bestvideo+bestaudio/best"
 
-            outtmpl = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
+            outtmpl = os.path.join(target_dir, "%(title)s.%(ext)s")
 
             ydl_opts = {
                 "format": fmt,
@@ -466,15 +586,15 @@ class PremiumYoutubeDownloader:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
 
-            self.root.after(0, self.on_success)
+            self.root.after(0, self.on_success, target_dir)
         except Exception as e:
             self.root.after(0, self.on_error, e)
 
-    def on_success(self):
+    def on_success(self, target_dir):
         self.finish_download()
         self.status_label.config(text="✨ ดาวน์โหลดสำเร็จเรียบร้อย!", fg=COLORS["success"])
         self.progress["value"] = 100
-        messagebox.showinfo("สำเร็จ!", f"ไฟล์ของคุณถูกบันทึกไว้ที่:\n{DOWNLOAD_DIR}")
+        messagebox.showinfo("สำเร็จ!", f"ไฟล์ของคุณถูกบันทึกไว้ที่:\n{target_dir}")
         self.url_entry.delete(0, tk.END)
         self.showing_placeholder = True
         self.url_entry.config(fg=COLORS["muted_text"], bg=COLORS["card"])
@@ -491,6 +611,7 @@ class PremiumYoutubeDownloader:
         self.download_btn.config(state=tk.NORMAL, bg=COLORS["accent2"], fg="#11111b")
         self.paste_btn.config(state=tk.NORMAL)
         self.open_folder_btn.config(state=tk.NORMAL)
+        self.change_folder_btn.config(state=tk.NORMAL)
 
 
 if __name__ == "__main__":
